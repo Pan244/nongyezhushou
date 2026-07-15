@@ -4,12 +4,8 @@
 """
 import os
 from pathlib import Path
-try:
-    import chromadb
-    from chromadb.utils import embedding_functions
-    HAS_CHROMADB = True
-except ImportError:
-    HAS_CHROMADB = False
+import chromadb
+from chromadb.utils import embedding_functions
 
 BASE_DIR = Path(__file__).parent
 DB_DIR = BASE_DIR / "data" / "chroma_db"
@@ -172,50 +168,25 @@ CROP_KNOWLEDGE = [
 ]
 
 
-def _get_embedding_fn():
-    """获取 Embedding 函数，远程环境降级到简易模式"""
+def build_knowledge_base():
+    """构建/重建病虫害知识库"""
+    client = chromadb.PersistentClient(path=str(DB_DIR))
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 使用 OpenAI Embedding（如果 API Key 可用），否则用默认
     api_key = os.getenv("DASHSCOPE_API_KEY") or os.getenv("OPENAI_API_KEY")
-    # 尝试用 OpenAI 兼容的 Embedding
     if api_key:
         try:
             ef = embedding_functions.OpenAIEmbeddingFunction(
                 api_key=api_key,
                 model_name="text-embedding-3-small",
             )
-            ef(["test"])  # 验证能调通
-            return ef
         except Exception:
-            pass
-    # 回退：简易 Embedding（不依赖外部模型，Day 06 教学内容）
-    return SimpleEmbeddingFunction()
+            ef = embedding_functions.DefaultEmbeddingFunction()
+    else:
+        ef = embedding_functions.DefaultEmbeddingFunction()
 
-
-class SimpleEmbeddingFunction:
-    """简易 Embedding — 课程 Day 06 教学实现，不依赖任何外部模型"""
-    def __init__(self):
-        import hashlib
-        self._h = hashlib
-
-    def __call__(self, texts):
-        import math
-        out = []
-        for t in texts:
-            b = self._h.sha256(t.encode()).digest()
-            v = [(b[i % len(b)] / 255.0) * 2 - 1 for i in range(128)]
-            n = math.sqrt(sum(x * x for x in v))
-            out.append([x / n for x in v] if n else v)
-        return out
-
-
-def build_knowledge_base():
-    """构建/重建病虫害知识库"""
-    if not HAS_CHROMADB:
-        print("⚠️ ChromaDB 未安装，跳过知识库（RAG 降级为纯 LLM）")
-        return None
-    client = chromadb.PersistentClient(path=str(DB_DIR))
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-    ef = _get_embedding_fn()
-
+    # 删除旧 Collection 重建
     try: client.delete_collection("crop_diseases")
     except Exception: pass
 
@@ -225,6 +196,7 @@ def build_knowledge_base():
         metadata={"description": "农作物病虫害知识库", "hnsw:space": "cosine"},
     )
 
+    # 添加文档
     docs = []
     metas = []
     ids = []
@@ -235,14 +207,12 @@ def build_knowledge_base():
         ids.append(f"disease_{i}")
 
     col.add(documents=docs, metadatas=metas, ids=ids)
-    print(f"✅ 病虫害知识库已就绪：{len(docs)} 条记录（{'简易Embedding' if isinstance(ef, SimpleEmbeddingFunction) else 'OpenAI Embedding'}）")
+    print(f"✅ 病虫害知识库已就绪：{len(docs)} 条记录")
     return col
 
 
 def get_collection():
     """获取知识库 Collection"""
-    if not HAS_CHROMADB:
-        return build_knowledge_base()
     client = chromadb.PersistentClient(path=str(DB_DIR))
     try:
         return client.get_collection("crop_diseases")
@@ -252,8 +222,6 @@ def get_collection():
 
 def search_knowledge(query: str, n_results: int = 3) -> list:
     """搜索病虫害知识"""
-    if not HAS_CHROMADB:
-        return []
     try:
         col = get_collection()
         results = col.query(query_texts=[query], n_results=n_results, include=["documents", "metadatas", "distances"])
