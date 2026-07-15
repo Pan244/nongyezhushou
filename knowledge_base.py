@@ -4,8 +4,12 @@
 """
 import os
 from pathlib import Path
-import chromadb
-from chromadb.utils import embedding_functions
+try:
+    import chromadb
+    from chromadb.utils import embedding_functions
+    HAS_CHROMADB = True
+except ImportError:
+    HAS_CHROMADB = False
 
 BASE_DIR = Path(__file__).parent
 DB_DIR = BASE_DIR / "data" / "chroma_db"
@@ -205,6 +209,9 @@ class SimpleEmbeddingFunction:
 
 def build_knowledge_base():
     """构建/重建病虫害知识库"""
+    if not HAS_CHROMADB:
+        print("⚠️ ChromaDB 未安装，跳过知识库（RAG 降级为纯 LLM）")
+        return None
     client = chromadb.PersistentClient(path=str(DB_DIR))
     DB_DIR.mkdir(parents=True, exist_ok=True)
     ef = _get_embedding_fn()
@@ -234,6 +241,8 @@ def build_knowledge_base():
 
 def get_collection():
     """获取知识库 Collection"""
+    if not HAS_CHROMADB:
+        return build_knowledge_base()
     client = chromadb.PersistentClient(path=str(DB_DIR))
     try:
         return client.get_collection("crop_diseases")
@@ -243,6 +252,8 @@ def get_collection():
 
 def search_knowledge(query: str, n_results: int = 3) -> list:
     """搜索病虫害知识"""
+    if not HAS_CHROMADB:
+        return []
     try:
         col = get_collection()
         results = col.query(query_texts=[query], n_results=n_results, include=["documents", "metadatas", "distances"])
