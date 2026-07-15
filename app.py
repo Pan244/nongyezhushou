@@ -15,8 +15,20 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
-from knowledge_base import search_knowledge, build_knowledge_base
-from langchain_handler import chat_stream_with_rag
+# 知识库（可选）
+try:
+    from knowledge_base import search_knowledge, build_knowledge_base
+except ImportError:
+    search_knowledge = lambda *a, **kw: []
+    build_knowledge_base = lambda: None
+
+# LangChain（可选，无则用 httpx 直调）
+try:
+    from langchain_handler import chat_stream_with_rag
+    HAS_LANGCHAIN = True
+except ImportError:
+    HAS_LANGCHAIN = False
+    chat_stream_with_rag = None
 
 # ============================================================
 # 配置
@@ -239,27 +251,57 @@ async def chat(request: ChatRequest):
 
     messages.append(user_msg)
 
-    # LangChain 流式 RAG（Day 8-9 教学内容）
+    # 流式生成（LangChain 优先，httpx 兜底）
     history_messages = conv.get("messages", [])[-20:]
 
-    async def stream_langchain():
-        full_text = ""
-        try:
-            async for chunk in chat_stream_with_rag(
-                question=request.message or "请帮我看看这张作物照片",
-                history=history_messages
-            ):
-                full_text += chunk
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-        finally:
-            yield "data: [DONE]\n\n"
-            if full_text:
-                _add_message(request.user_id, request.conversation_id, "assistant", full_text)
+    if HAS_LANGCHAIN:
+        async def stream_gen():
+            full = ""
+            try:
+                async for chunk in chat_stream_with_rag(
+                    question=request.message or "请帮我看看这张作物照片",
+                    history=history_messages
+                ):
+                    full += chunk
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+                if full:
+                    _add_message(request.user_id, request.conversation_id, "assistant", full)
+    else:
+        async def stream_gen():
+            full = ""
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream(
+                        "POST", f"{ENDPOINT.rstrip('/')}/chat/completions",
+                        headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+                        json={"model": MODEL, "messages": messages, "stream": True, "max_tokens": 1500, "temperature": 0.7},
+                    ) as resp:
+                        if resp.status_code != 200:
+                            body = await resp.aread()
+                            yield f"data: {json.dumps({'error': f'API {resp.status_code}'})}\n\ndata: [DONE]\n\n"
+                            return
+                        async for line in resp.aiter_lines():
+                            if line and line.startswith("data:"):
+                                yield f"{line}\n\n"
+                                data_str = line[5:].strip()
+                                if data_str != "[DONE]":
+                                    try:
+                                        d = json.loads(data_str)
+                                        full += d["choices"][0]["delta"].get("content", "")
+                                    except Exception: pass
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\ndata: [DONE]\n\n"
+            finally:
+                yield "data: [DONE]\n\n"
+                if full:
+                    _add_message(request.user_id, request.conversation_id, "assistant", full)
 
     return StreamingResponse(
-        stream_langchain(),
+        stream_gen(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
